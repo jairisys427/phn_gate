@@ -1,8 +1,8 @@
+// server.js
 import express from "express";
 import bodyParser from "body-parser";
 import dotenv from "dotenv";
 import { randomUUID } from "crypto";
-
 import {
   StandardCheckoutClient,
   Env,
@@ -12,10 +12,12 @@ import {
   RefundRequest,
 } from "pg-sdk-node";
 
+import { saveOrder, getOrderByMerchantId } from "./db.js";
+
 dotenv.config();
 
 /* ----------------------------------------
-   Helpers: trim, mask
+   Helpers
 ----------------------------------------- */
 const trim = (v) => (typeof v === "string" ? v.trim() : v);
 const mask = (s, keep = 4) => {
@@ -37,22 +39,17 @@ const PHONEPE_ENV =
     : Env.SANDBOX);
 
 if (!MERCHANT_ID || !SALT_KEY || Number.isNaN(SALT_INDEX)) {
-  console.error("Missing/invalid PhonePe config in .env. Values read:", {
-    MERCHANT_ID: MERCHANT_ID ? mask(MERCHANT_ID) : "<missing>",
-    PHONEPE_SALT_KEY: SALT_KEY ? mask(SALT_KEY, 6) : "<missing>",
-    PHONEPE_SALT_INDEX: SALT_INDEX_RAW || "<missing>",
-    PHONEPE_ENV: process.env.PHONEPE_ENV || "<missing>",
-  });
+  console.error("Missing/invalid PhonePe config in .env");
   process.exit(1);
 }
 
 /* ----------------------------------------
-   Initialize PhonePe SDK (only once)
+   Initialize PhonePe SDK
 ----------------------------------------- */
 let phonepeClient;
 try {
   console.log(
-    `Initializing PhonePe SDK (merchant=${mask(MERCHANT_ID)}, saltIndex=${SALT_INDEX}, env=${PHONEPE_ENV === Env.PRODUCTION ? "PRODUCTION" : "SANDBOX"})`
+    `Initializing PhonePe SDK (merchant=${mask(MERCHANT_ID)}, env=${PHONEPE_ENV === Env.PRODUCTION ? "PRODUCTION" : "SANDBOX"})`
   );
   phonepeClient = StandardCheckoutClient.getInstance(
     MERCHANT_ID,
@@ -61,7 +58,7 @@ try {
     PHONEPE_ENV
   );
 } catch (err) {
-  console.error("PhonePe SDK initialization failed:", err?.message || err);
+  console.error("PhonePe SDK init failed:", err?.message);
   process.exit(1);
 }
 
@@ -79,7 +76,7 @@ app.use(
 app.use(bodyParser.urlencoded({ extended: true }));
 
 /* ----------------------------------------
-   CORS middleware
+   CORS
 ----------------------------------------- */
 const ALLOWED_ORIGINS = (process.env.ALLOWED_ORIGINS || "http://localhost:3000")
   .split(",")
@@ -93,30 +90,28 @@ app.use((req, res, next) => {
   } else {
     res.setHeader("Access-Control-Allow-Origin", ALLOWED_ORIGINS[0] || "*");
   }
-  res.setHeader("Access-Control-Allow-Methods", "GET,POST,PUT,PATCH,DELETE,OPTIONS");
-  res.setHeader("Access-Control-Allow-Headers", "Content-Type, Authorization, X-Requested-With");
+  res.setHeader("Access-Control-Allow-Methods", "GET,POST,OPTIONS");
+  res.setHeader("Access-Control-Allow-Headers", "Content-Type, Authorization");
   res.setHeader("Access-Control-Allow-Credentials", "true");
 
-  if (req.method === "OPTIONS") {
-    return res.sendStatus(204);
-  }
+  if (req.method === "OPTIONS") return res.sendStatus(204);
   next();
 });
 
 const PORT = process.env.PORT || 5000;
 
 /* ----------------------------------------
-   1) Standard Checkout Payment (Web)
+   1) Pay (Web)
 ----------------------------------------- */
 app.post("/api/phonepe/pay", async (req, res) => {
   try {
     const { amountInPaise, redirectUrl, meta } = req.body;
 
     if (!amountInPaise || amountInPaise < 100) {
-      return res.status(400).json({ success: false, message: "Amount must be >= 100 paisa" });
+      return res.status(400).json({ success: false, message: "Amount >= 100 paise" });
     }
     if (!redirectUrl) {
-      return res.status(400).json({ success: false, message: "redirectUrl is required" });
+      return res.status(400).json({ success: false, message: "redirectUrl required" });
     }
 
     const merchantOrderId = `MUID-${randomUUID().slice(0, 16)}`;
@@ -124,8 +119,8 @@ app.post("/api/phonepe/pay", async (req, res) => {
     let metaInfo = undefined;
     if (meta) {
       const builder = MetaInfo.builder();
-      if (meta.udf1) builder.udf1(meta.udf1);
-      if (meta.udf2) builder.udf2(meta.udf2);
+      if (meta.udf1) builder.udf1(meta.udf1); // phone
+      if (meta.udf2) builder.udf2(meta.udf2); // email
       if (meta.udf3) builder.udf3(meta.udf3);
       metaInfo = builder.build();
     }
@@ -146,39 +141,15 @@ app.post("/api/phonepe/pay", async (req, res) => {
         redirectUrl: response.redirectUrl,
       });
     } else {
-      // Handle onboarding block
       return res.status(403).json({
         success: false,
         error: "Account not activated",
-        errorCode: "INTERNAL_SECURITY_BLOCK_1",
         onboardingUrl: response.data?.Onboarding_URL?.[0] || null,
-        message: "Complete onboarding at the provided URL",
       });
     }
   } catch (err) {
-    console.error("Payment initiation failed:", {
-      message: err?.message,
-      type: err?.type,
-      code: err?.code,
-      httpStatusCode: err?.httpStatusCode,
-      data: err?.data,
-    });
-
-    // Handle specific PhonePe errors
-    if (err?.httpStatusCode === 400 && err?.data?.errorCode === "INTERNAL_SECURITY_BLOCK_1") {
-      return res.status(403).json({
-        success: false,
-        error: "Account not activated for transactions",
-        errorCode: "INTERNAL_SECURITY_BLOCK_1",
-        onboardingUrl: err?.data?.Onboarding_URL?.[0] || null,
-        message: "Please complete merchant onboarding on PhonePe dashboard",
-      });
-    }
-
-    return res.status(500).json({
-      success: false,
-      error: err?.message || "Payment initiation failed",
-    });
+    console.error("Pay error:", err);
+    return res.status(500).json({ success: false, error: err?.message || "Failed" });
   }
 });
 
@@ -243,7 +214,7 @@ app.post("/api/phonepe/refund", async (req, res) => {
 });
 
 /* ----------------------------------------
-   5) Webhook
+   5) Webhook – Save to DB on success
 ----------------------------------------- */
 app.post("/api/phonepe/webhook", async (req, res) => {
   try {
@@ -254,7 +225,7 @@ app.post("/api/phonepe/webhook", async (req, res) => {
     const callbackPass = process.env.CALLBACK_PASSWORD;
 
     if (!callbackUser || !callbackPass) {
-      return res.status(500).send("Webhook credentials not configured");
+      return res.status(500).send("Webhook auth missing");
     }
 
     const callbackResponse = phonepeClient.validateCallback(
@@ -264,21 +235,64 @@ app.post("/api/phonepe/webhook", async (req, res) => {
       bodyString
     );
 
-    console.log("PHONEPE WEBHOOK:", callbackResponse.type);
-    console.log("Payload:", JSON.stringify(callbackResponse.payload, null, 2));
+    const payload = callbackResponse.payload;
+    console.log("WEBHOOK PAYLOAD:", JSON.stringify(payload, null, 2));
 
-    // TODO: Update your DB with payment status
-    // if (callbackResponse.payload.paymentState === "COMPLETED") { ... }
+    const merchantOrderId = payload.merchantOrderId;
+    const paymentState    = payload.paymentState;
+    const amountPaise     = payload.amount;
+    const transactionTime = payload.transactionTime;
+
+    const phone = payload?.meta?.udf1 ?? null;
+    const email = payload?.meta?.udf2 ?? null;
+
+    const isSuccess = paymentState === "COMPLETED";
+    const status = isSuccess ? "SUCCESS" : "FAILED";
+
+    await saveOrder({
+      merchantOrderId,
+      transactionTime,
+      phone,
+      email,
+      amountPaise,
+      status,
+    });
 
     return res.json({ success: true });
   } catch (err) {
-    console.error("Webhook validation failed:", err?.message);
-    return res.status(403).send("Invalid callback");
+    console.error("Webhook failed:", err?.message);
+    return res.status(403).send("Invalid");
   }
 });
 
 /* ----------------------------------------
-   6) Health Check
+   6) Get Order (Optional)
+----------------------------------------- */
+// server.js – inside the /api/order route
+app.get("/api/order/:merchantOrderId", async (req, res) => {
+  try {
+    const order = await getOrderByMerchantId(req.params.merchantOrderId);
+    if (!order) return res.status(404).json({ error: "Order not found" });
+
+    // Send clean, front-end-ready fields
+    res.json({
+      order_number: order.order_number,
+      merchant_order_id: order.merchant_order_id,
+      amount: (order.amount_paise / 100).toFixed(2),
+      email: order.email || "Not provided",
+      phone: order.phone_number || "Not provided",
+      date: new Date(order.transaction_date).toLocaleDateString('en-IN'),
+      transaction_id: order.merchant_order_id, // fallback
+      status: order.status,
+    });
+  } catch (err) {
+    console.error(err);
+    res.status(500).json({ error: "Server error" });
+  }
+});
+
+/* ----------------------------------------
+   7) Health
 ----------------------------------------- */
 app.get("/health", (req, res) => {
   res.json({
@@ -293,9 +307,6 @@ app.get("/health", (req, res) => {
    Start Server
 ----------------------------------------- */
 app.listen(PORT, () => {
-  console.log(`PhonePe backend LIVE on http://localhost:${PORT}`);
+  console.log(`Server running on http://localhost:${PORT}`);
   console.log(`Environment: ${PHONEPE_ENV === Env.PRODUCTION ? "PRODUCTION" : "SANDBOX"}`);
-  if (PHONEPE_ENV === Env.PRODUCTION) {
-    console.log("Ensure your merchant account is ACTIVATED on PhonePe dashboard!");
-  }
 });
