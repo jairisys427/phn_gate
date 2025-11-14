@@ -12,7 +12,7 @@ import {
   RefundRequest,
 } from "pg-sdk-node";
 
-import { saveOrder, getOrderByMerchantId } from "./db.js";
+import { createPendingOrder, updateOrderStatus, getOrderByMerchantId } from "./db.js";
 
 dotenv.config();
 
@@ -101,29 +101,33 @@ app.use((req, res, next) => {
 const PORT = process.env.PORT || 5000;
 
 /* ----------------------------------------
-   1) Pay (Web)
+   1) Pay (Web) - Now creates a PENDING order first
 ----------------------------------------- */
 app.post("/api/phonepe/pay", async (req, res) => {
   try {
-    const { amountInPaise, redirectUrl, meta } = req.body;
+    const { amountInPaise, redirectUrl, name, email, phone, courseId } = req.body;
 
-    if (!amountInPaise || amountInPaise < 100) {
-      return res.status(400).json({ success: false, message: "Amount >= 100 paise" });
-    }
-    if (!redirectUrl) {
-      return res.status(400).json({ success: false, message: "redirectUrl required" });
+    if (!amountInPaise || amountInPaise < 100 || !redirectUrl || !name || !email || !phone || !courseId) {
+      return res.status(400).json({ success: false, message: "Missing required fields" });
     }
 
     const merchantOrderId = `MUID-${randomUUID().slice(0, 16)}`;
 
-    let metaInfo = undefined;
-    if (meta) {
-      const builder = MetaInfo.builder();
-      if (meta.udf1) builder.udf1(meta.udf1); // phone
-      if (meta.udf2) builder.udf2(meta.udf2); // email
-      if (meta.udf3) builder.udf3(meta.udf3);
-      metaInfo = builder.build();
-    }
+    // Create a pending order in the database before initiating payment
+    await createPendingOrder({
+      merchantOrderId,
+      userName: name,
+      email,
+      phone,
+      courseId,
+      amountPaise: amountInPaise
+    });
+
+    const metaInfo = MetaInfo.builder()
+      .udf1(courseId) // Store course ID
+      .udf2(email) // Store email
+      .udf3(phone) // Store phone
+      .build();
 
     const request = StandardCheckoutPayRequest.builder()
       .merchantOrderId(merchantOrderId)
@@ -156,6 +160,7 @@ app.post("/api/phonepe/pay", async (req, res) => {
 /* ----------------------------------------
    2) SDK Order (Mobile)
 ----------------------------------------- */
+// This remains unchanged, but a similar `createPendingOrder` logic should be added if used.
 app.post("/api/phonepe/create_sdk_order", async (req, res) => {
   try {
     const { amountInPaise, redirectUrl } = req.body;
@@ -176,6 +181,7 @@ app.post("/api/phonepe/create_sdk_order", async (req, res) => {
     return res.status(500).json({ success: false, error: err?.message });
   }
 });
+
 
 /* ----------------------------------------
    3) Order Status
@@ -214,7 +220,7 @@ app.post("/api/phonepe/refund", async (req, res) => {
 });
 
 /* ----------------------------------------
-   5) Webhook – Save to DB on success
+   5) Webhook – Now updates the order status
 ----------------------------------------- */
 app.post("/api/phonepe/webhook", async (req, res) => {
   try {
@@ -240,21 +246,15 @@ app.post("/api/phonepe/webhook", async (req, res) => {
 
     const merchantOrderId = payload.merchantOrderId;
     const paymentState    = payload.paymentState;
-    const amountPaise     = payload.amount;
     const transactionTime = payload.transactionTime;
-
-    const phone = payload?.meta?.udf1 ?? null;
-    const email = payload?.meta?.udf2 ?? null;
-
+    
     const isSuccess = paymentState === "COMPLETED";
     const status = isSuccess ? "SUCCESS" : "FAILED";
 
-    await saveOrder({
+    // Update the existing order's status
+    await updateOrderStatus({
       merchantOrderId,
       transactionTime,
-      phone,
-      email,
-      amountPaise,
       status,
     });
 
@@ -265,25 +265,26 @@ app.post("/api/phonepe/webhook", async (req, res) => {
   }
 });
 
+
 /* ----------------------------------------
-   6) Get Order (Optional)
+   6) Get Order (Updated)
 ----------------------------------------- */
-// server.js – inside the /api/order route
 app.get("/api/order/:merchantOrderId", async (req, res) => {
   try {
     const order = await getOrderByMerchantId(req.params.merchantOrderId);
     if (!order) return res.status(404).json({ error: "Order not found" });
 
-    // Send clean, front-end-ready fields
+    // Send clean, front-end-ready fields, including status
     res.json({
       order_number: order.order_number,
       merchant_order_id: order.merchant_order_id,
       amount: (order.amount_paise / 100).toFixed(2),
+      name: order.user_name || "Not provided",
       email: order.email || "Not provided",
       phone: order.phone_number || "Not provided",
-      date: new Date(order.transaction_date).toLocaleDateString('en-IN'),
+      date: order.transaction_date ? new Date(order.transaction_date).toLocaleDateString('en-IN') : 'N/A',
       transaction_id: order.merchant_order_id, // fallback
-      status: order.status,
+      status: order.status, // CRITICAL: send the status to the frontend
     });
   } catch (err) {
     console.error(err);
