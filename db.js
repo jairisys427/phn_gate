@@ -19,7 +19,8 @@ const db = createClient({
   authToken: TURSO_AUTH_TOKEN,
 });
 
-// Create table on module load with new fields and status
+// This schema is correct for future/new databases.
+// The ALTER command was needed to update your existing one.
 (async () => {
   try {
     await db.execute(`
@@ -30,8 +31,8 @@ const db = createClient({
         transaction_date  TEXT,
         phone_number      TEXT,
         email             TEXT,
-        user_name         TEXT,
-        course_id         TEXT,
+        user_name         TEXT,    -- This column is now in your DB
+        course_id         TEXT,    -- This column is now in your DB
         amount_paise      INTEGER NOT NULL,
         status            TEXT    NOT NULL CHECK(status IN ('SUCCESS','FAILED','PENDING')),
         created_at        TEXT    NOT NULL DEFAULT (datetime('now'))
@@ -111,7 +112,8 @@ export async function updateOrderStatus({
 
     const result = await db.execute({ sql, args });
     console.log(`DB UPDATE SUCCESS: Affected rows: ${result.rowsAffected} | Order#: ${orderNumber || 'N/A'}`);
-  } catch (err) {
+  } catch (err)
+ {
     console.error("DB UPDATE FAILED:", err.message || err);
     // Don't throw - webhook must return 200 OK
   }
