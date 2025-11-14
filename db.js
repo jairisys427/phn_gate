@@ -19,7 +19,7 @@ const db = createClient({
   authToken: TURSO_AUTH_TOKEN,
 });
 
-// Create table on module load
+// Create table on module load with new fields and status
 (async () => {
   try {
     await db.execute(`
@@ -27,11 +27,13 @@ const db = createClient({
         id                INTEGER PRIMARY KEY AUTOINCREMENT,
         order_number      TEXT    UNIQUE,
         merchant_order_id TEXT    NOT NULL UNIQUE,
-        transaction_date  TEXT    NOT NULL,
+        transaction_date  TEXT,
         phone_number      TEXT,
         email             TEXT,
+        user_name         TEXT,
+        course_id         TEXT,
         amount_paise      INTEGER NOT NULL,
-        status            TEXT    NOT NULL CHECK(status IN ('SUCCESS','FAILED')),
+        status            TEXT    NOT NULL CHECK(status IN ('SUCCESS','FAILED','PENDING')),
         created_at        TEXT    NOT NULL DEFAULT (datetime('now'))
       )
     `);
@@ -42,67 +44,80 @@ const db = createClient({
   }
 })();
 
-// Generate order number
-export function generateOrderNumber() {
+// Helper to generate a unique order number for successful transactions
+function generateOrderNumber() {
   const now = new Date();
   const datePart = now.toISOString().slice(0, 10).replace(/-/g, "");
   const rand = Math.floor(100000 + Math.random() * 900000);
   return `ORD-${datePart}-${rand}`;
 }
 
-// Save order with logging
-export async function saveOrder({
+// 1. Create a PENDING order when payment is initiated
+export async function createPendingOrder({
   merchantOrderId,
-  transactionTime,
-  phone,
+  userName,
   email,
+  phone,
+  courseId,
   amountPaise,
-  status,
 }) {
   try {
-    console.log(`DB SAVE: ${merchantOrderId} | ${status} | ₹${amountPaise/100} | ${email} | ${phone}`);
-
-    const orderNumber = status === "SUCCESS" ? generateOrderNumber() : null;
-
-    const sql = status === "SUCCESS"
-      ? `
-        INSERT INTO orders (order_number, merchant_order_id, transaction_date,
-                            phone_number, email, amount_paise, status)
-        VALUES (?, ?, ?, ?, ?, ?, ?)
-        ON CONFLICT(merchant_order_id) DO UPDATE SET
-          order_number   = excluded.order_number,
-          transaction_date = excluded.transaction_date,
-          phone_number   = excluded.phone_number,
-          email          = excluded.email,
-          amount_paise   = excluded.amount_paise,
-          status         = excluded.status
-      `
-      : `
-        INSERT INTO orders (merchant_order_id, transaction_date,
-                            phone_number, email, amount_paise, status)
-        VALUES (?, ?, ?, ?, ?, ?)
-        ON CONFLICT(merchant_order_id) DO UPDATE SET
-          transaction_date = excluded.transaction_date,
-          phone_number     = excluded.phone_number,
-          email            = excluded.email,
-          amount_paise     = excluded.amount_paise,
-          status           = excluded.status
-      `;
-
-    const args = status === "SUCCESS"
-      ? [orderNumber, merchantOrderId, transactionTime, phone, email, amountPaise, status]
-      : [merchantOrderId, transactionTime, phone, email, amountPaise, status];
-
+    const sql = `
+      INSERT INTO orders (merchant_order_id, user_name, email, phone_number, course_id, amount_paise, status)
+      VALUES (?, ?, ?, ?, ?, ?, 'PENDING')
+      ON CONFLICT(merchant_order_id) DO NOTHING
+    `;
+    const args = [merchantOrderId, userName, email, phone, courseId, amountPaise];
     const result = await db.execute({ sql, args });
-    console.log(`DB SAVE SUCCESS: Affected rows: ${result.rowsAffected} | Order#: ${orderNumber || 'N/A'}`);
+    console.log(`DB PENDING: ${merchantOrderId} | User: ${userName} | Rows affected: ${result.rowsAffected}`);
+    return result;
   } catch (err) {
-    console.error("DB SAVE FAILED:", err.message || err);
-    console.error("Full error:", err);
-    // Don't throw - webhook must 200
+    console.error("DB PENDING FAILED:", err);
+    throw err; // Re-throw to be caught by the API route
   }
 }
 
-// Get order
+
+// 2. Update order status from webhook
+export async function updateOrderStatus({
+  merchantOrderId,
+  transactionTime,
+  status, // 'SUCCESS' or 'FAILED'
+}) {
+  try {
+    console.log(`DB UPDATE: ${merchantOrderId} | Status: ${status}`);
+
+    const isSuccess = status === "SUCCESS";
+    const orderNumber = isSuccess ? generateOrderNumber() : null;
+
+    const sql = isSuccess
+      ? `
+        UPDATE orders SET
+          status = ?,
+          order_number = ?,
+          transaction_date = ?
+        WHERE merchant_order_id = ? AND status = 'PENDING'
+      `
+      : `
+        UPDATE orders SET
+          status = ?,
+          transaction_date = ?
+        WHERE merchant_order_id = ? AND status = 'PENDING'
+      `;
+      
+    const args = isSuccess
+      ? [status, orderNumber, transactionTime, merchantOrderId]
+      : [status, transactionTime, merchantOrderId];
+
+    const result = await db.execute({ sql, args });
+    console.log(`DB UPDATE SUCCESS: Affected rows: ${result.rowsAffected} | Order#: ${orderNumber || 'N/A'}`);
+  } catch (err) {
+    console.error("DB UPDATE FAILED:", err.message || err);
+    // Don't throw - webhook must return 200 OK
+  }
+}
+
+// Get order by merchant order ID (no changes needed)
 export async function getOrderByMerchantId(merchantOrderId) {
   try {
     const { rows } = await db.execute({
