@@ -22,7 +22,6 @@ const mask = (s, keep = 4) => {
   return s.slice(0, keep) + "*".repeat(Math.max(6, s.length - keep * 2)) + s.slice(-keep);
 };
 
-
 /* ----------------------------------------
    Load and validate env
 ----------------------------------------- */
@@ -98,7 +97,7 @@ app.use((req, res, next) => {
 const PORT = process.env.PORT || 5000;
 
 /* ----------------------------------------
-   1) Pay (Web) - Now creates a PENDING order first
+   1) Pay (Web) - Now creates a PENDING order first and appends merchantOrderId to redirectUrl
 ----------------------------------------- */
 app.post("/api/phonepe/pay", async (req, res) => {
   try {
@@ -120,6 +119,11 @@ app.post("/api/phonepe/pay", async (req, res) => {
       amountPaise: amountInPaise
     });
 
+    // Append merchantOrderId to redirectUrl so the frontend can pick it up after redirect
+    const incomingRedirect = redirectUrl || "";
+    const separator = incomingRedirect.includes('?') ? '&' : '?';
+    const redirectWithId = `${incomingRedirect}${separator}merchantOrderId=${encodeURIComponent(merchantOrderId)}`;
+
     const metaInfo = MetaInfo.builder()
       .udf1(courseId) // Store course ID
       .udf2(email) // Store email
@@ -129,7 +133,7 @@ app.post("/api/phonepe/pay", async (req, res) => {
     const request = StandardCheckoutPayRequest.builder()
       .merchantOrderId(merchantOrderId)
       .amount(amountInPaise)
-      .redirectUrl(redirectUrl)
+      .redirectUrl(redirectWithId)
       .metaInfo(metaInfo)
       .build();
 
@@ -155,30 +159,47 @@ app.post("/api/phonepe/pay", async (req, res) => {
 });
 
 /* ----------------------------------------
-   2) SDK Order (Mobile)
+   2) SDK Order (Mobile) - create pending DB entry and append merchantOrderId to redirectUrl
 ----------------------------------------- */
-// This remains unchanged, but a similar `createPendingOrder` logic should be added if used.
 app.post("/api/phonepe/create_sdk_order", async (req, res) => {
   try {
-    const { amountInPaise, redirectUrl } = req.body;
+    const { amountInPaise, redirectUrl, name, email, phone, courseId } = req.body;
     if (!amountInPaise || amountInPaise < 100 || !redirectUrl) {
       return res.status(400).json({ success: false, message: "Invalid input" });
     }
 
     const merchantOrderId = `MUID-${randomUUID().slice(0, 16)}`;
+
+    // Create pending order
+    try {
+      await createPendingOrder({
+        merchantOrderId,
+        userName: name || null,
+        email: email || null,
+        phone: phone || null,
+        courseId: courseId || null,
+        amountPaise: amountInPaise,
+      });
+    } catch (dbErr) {
+      console.error("Failed to create pending SDK order:", dbErr);
+      // continue - still try to create SDK order
+    }
+
+    const redirectWithId = `${redirectUrl}${redirectUrl.includes('?') ? '&' : '?'}merchantOrderId=${encodeURIComponent(merchantOrderId)}`;
+
     const request = CreateSdkOrderRequest.StandardCheckoutBuilder()
       .merchantOrderId(merchantOrderId)
       .amount(amountInPaise)
-      .redirectUrl(redirectUrl)
+      .redirectUrl(redirectWithId)
       .build();
 
     const response = await phonepeClient.createSdkOrder(request);
     return res.json({ success: true, merchantOrderId, token: response.token });
   } catch (err) {
+    console.error("/create_sdk_order failed:", err);
     return res.status(500).json({ success: false, error: err?.message });
   }
 });
-
 
 /* ----------------------------------------
    3) Order Status
@@ -217,7 +238,7 @@ app.post("/api/phonepe/refund", async (req, res) => {
 });
 
 /* ----------------------------------------
-   5) Webhook – Now updates the order status
+   5) Webhook – Now updates the order status (robust timestamp handling)
 ----------------------------------------- */
 app.post("/api/phonepe/webhook", async (req, res) => {
   try {
@@ -231,40 +252,62 @@ app.post("/api/phonepe/webhook", async (req, res) => {
       return res.status(500).send("Webhook auth missing");
     }
 
-    const callbackResponse = phonepeClient.validateCallback(callbackUser, callbackPass, authHeader, bodyString);
+    // Validate callback (SDK helper). It should throw or return an object with payload
+    let callbackResponse;
+    try {
+      callbackResponse = phonepeClient.validateCallback(callbackUser, callbackPass, authHeader, bodyString);
+    } catch (err) {
+      console.error("Callback validation failed:", err?.message || err);
+      return res.status(403).send("Invalid callback");
+    }
+
     const payload = callbackResponse.payload;
     console.log("WEBHOOK PAYLOAD:", JSON.stringify(payload, null, 2));
 
-    const merchantOrderId = payload.merchantOrderId;
-    
-    // FIX #1: Use `payload.state` instead of `payload.paymentState`
-    const paymentState = payload.state;
+    const merchantOrderId = payload?.merchantOrderId;
+    if (!merchantOrderId) {
+      console.warn("Webhook missing merchantOrderId, ignoring.");
+      return res.status(400).send("Missing merchantOrderId");
+    }
 
-    // FIX #2: Extract timestamp from the correct nested location
-    // Use optional chaining `?.` for safety
-    const rawTimestamp = payload.paymentDetails?.[0]?.timestamp;
-    
-    // Convert Unix ms timestamp to ISO 8601 format (e.g., "2025-11-14T18:40:35.217Z")
-    const transactionTime = rawTimestamp ? new Date(rawTimestamp).toISOString() : new Date().toISOString();
-    
+    // payment state
+    const paymentState = payload.state;
     const isSuccess = paymentState === "COMPLETED";
     const status = isSuccess ? "SUCCESS" : "FAILED";
 
+    // Try to extract a timestamp robustly
+    let rawTimestamp = payload.paymentDetails?.[0]?.timestamp ?? payload.timestamp ?? null;
+
+    // Some providers send unix seconds, some send milliseconds. Normalize:
+    let transactionTime;
+    if (rawTimestamp) {
+      rawTimestamp = typeof rawTimestamp === "string" ? parseInt(rawTimestamp, 10) : rawTimestamp;
+      if (!Number.isNaN(rawTimestamp)) {
+        if (rawTimestamp < 1e12) rawTimestamp = rawTimestamp * 1000; // convert seconds -> ms
+        transactionTime = new Date(rawTimestamp).toISOString();
+      } else {
+        console.warn("Webhook timestamp parse failed, using server time");
+        transactionTime = new Date().toISOString();
+      }
+    } else {
+      transactionTime = new Date().toISOString();
+    }
+
+    console.log(`WEBHOOK: merchantOrderId=${merchantOrderId} state=${paymentState} time=${transactionTime}`);
+
     await updateOrderStatus({
       merchantOrderId,
-      transactionTime, // Pass the corrected time
-      status,          // Pass the corrected status
+      transactionTime,
+      status,
     });
 
     return res.json({ success: true });
   } catch (err) {
-    console.error("Webhook failed:", err?.message);
-    // Log the full error for better debugging
+    console.error("Webhook failed:", err?.message || err);
     console.error(err);
     return res.status(403).send("Invalid");
   }
 });
-
 
 /* ----------------------------------------
    6) Get Order (Updated)
@@ -274,7 +317,6 @@ app.get("/api/order/:merchantOrderId", async (req, res) => {
     const order = await getOrderByMerchantId(req.params.merchantOrderId);
     if (!order) return res.status(404).json({ error: "Order not found" });
 
-    // Send clean, front-end-ready fields, including status
     res.json({
       order_number: order.order_number,
       merchant_order_id: order.merchant_order_id,
@@ -283,8 +325,8 @@ app.get("/api/order/:merchantOrderId", async (req, res) => {
       email: order.email || "Not provided",
       phone: order.phone_number || "Not provided",
       date: order.transaction_date ? new Date(order.transaction_date).toLocaleDateString('en-IN') : 'N/A',
-      transaction_id: order.merchant_order_id, // fallback
-      status: order.status, // CRITICAL: send the status to the frontend
+      transaction_id: order.order_number || order.merchant_order_id, // prefer order_number
+      status: order.status,
     });
   } catch (err) {
     console.error(err);
