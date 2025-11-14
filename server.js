@@ -4,12 +4,8 @@ import bodyParser from "body-parser";
 import dotenv from "dotenv";
 import { randomUUID } from "crypto";
 import {
-  StandardCheckoutClient,
-  Env,
-  MetaInfo,
-  StandardCheckoutPayRequest,
-  CreateSdkOrderRequest,
-  RefundRequest,
+  StandardCheckoutClient, Env, MetaInfo,
+  StandardCheckoutPayRequest, CreateSdkOrderRequest, RefundRequest,
 } from "pg-sdk-node";
 
 import { createPendingOrder, updateOrderStatus, getOrderByMerchantId } from "./db.js";
@@ -25,6 +21,7 @@ const mask = (s, keep = 4) => {
   if (s.length <= keep * 2) return "*".repeat(s.length);
   return s.slice(0, keep) + "*".repeat(Math.max(6, s.length - keep * 2)) + s.slice(-keep);
 };
+
 
 /* ----------------------------------------
    Load and validate env
@@ -226,41 +223,44 @@ app.post("/api/phonepe/webhook", async (req, res) => {
   try {
     const authHeader = req.headers["authorization"] || "";
     const bodyString = req.rawBody?.toString("utf8") || "";
-
     const callbackUser = process.env.CALLBACK_USERNAME;
     const callbackPass = process.env.CALLBACK_PASSWORD;
 
     if (!callbackUser || !callbackPass) {
+      console.error("Webhook auth credentials missing in environment variables.");
       return res.status(500).send("Webhook auth missing");
     }
 
-    const callbackResponse = phonepeClient.validateCallback(
-      callbackUser,
-      callbackPass,
-      authHeader,
-      bodyString
-    );
-
+    const callbackResponse = phonepeClient.validateCallback(callbackUser, callbackPass, authHeader, bodyString);
     const payload = callbackResponse.payload;
     console.log("WEBHOOK PAYLOAD:", JSON.stringify(payload, null, 2));
 
     const merchantOrderId = payload.merchantOrderId;
-    const paymentState    = payload.paymentState;
-    const transactionTime = payload.transactionTime;
+    
+    // FIX #1: Use `payload.state` instead of `payload.paymentState`
+    const paymentState = payload.state;
+
+    // FIX #2: Extract timestamp from the correct nested location
+    // Use optional chaining `?.` for safety
+    const rawTimestamp = payload.paymentDetails?.[0]?.timestamp;
+    
+    // Convert Unix ms timestamp to ISO 8601 format (e.g., "2025-11-14T18:40:35.217Z")
+    const transactionTime = rawTimestamp ? new Date(rawTimestamp).toISOString() : new Date().toISOString();
     
     const isSuccess = paymentState === "COMPLETED";
     const status = isSuccess ? "SUCCESS" : "FAILED";
 
-    // Update the existing order's status
     await updateOrderStatus({
       merchantOrderId,
-      transactionTime,
-      status,
+      transactionTime, // Pass the corrected time
+      status,          // Pass the corrected status
     });
 
     return res.json({ success: true });
   } catch (err) {
     console.error("Webhook failed:", err?.message);
+    // Log the full error for better debugging
+    console.error(err);
     return res.status(403).send("Invalid");
   }
 });
