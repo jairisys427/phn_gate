@@ -3,7 +3,7 @@ import express from "express";
 import bodyParser from "body-parser";
 import dotenv from "dotenv";
 import { randomUUID, createHmac } from "crypto";
-import { Cashfree } from "cashfree-pg"; 
+import axios from "axios"; 
 
 import { createPendingOrder, updateOrderStatus, getOrderByMerchantId } from "./db.js";
 
@@ -26,14 +26,15 @@ if (!APP_ID || !SECRET_KEY) {
   process.exit(1);
 }
 
-/* ----------------------------------------
-   Initialize Cashfree SDK
------------------------------------------ */
-Cashfree.XClientId = APP_ID;
-Cashfree.XClientSecret = SECRET_KEY;
-Cashfree.XEnvironment = CASHFREE_ENV === "PRODUCTION" ? "PRODUCTION" : "SANDBOX";
+// Set Base URL based on Environment
+const CASHFREE_BASE_URL = CASHFREE_ENV === "PRODUCTION"
+  ? "https://api.cashfree.com"
+  : "https://sandbox.cashfree.com";
 
-console.log(`✅ Cashfree SDK initialized in ${Cashfree.XEnvironment} mode`);
+const API_VERSION = "2023-08-01";
+
+console.log(`✅ Server initialized in ${CASHFREE_ENV} mode`);
+console.log(`🔗 API URL: ${CASHFREE_BASE_URL}`);
 
 /* ----------------------------------------
    Express App
@@ -116,7 +117,7 @@ app.post("/api/cashfree/create_order", async (req, res) => {
     });
 
     // 2. Prepare Cashfree Request
-    const request = {
+    const orderRequest = {
       order_amount: parseFloat(amountInRupees),
       order_currency: "INR",
       order_id: merchantOrderId,
@@ -129,14 +130,27 @@ app.post("/api/cashfree/create_order", async (req, res) => {
       order_meta: {
         return_url: `${redirectUrl}?order_id=${merchantOrderId}`,
       },
-      order_note: courseId 
+      order_note: courseId
     };
 
-    // 3. Call Cashfree API
-    const response = await Cashfree.PGCreateOrder("2023-08-01", request);
-    const data = response.data;
+    console.log(`📤 Sending to Cashfree:`, JSON.stringify(orderRequest, null, 2));
 
-    console.log(`✅ Order created: ${data.order_id}`);
+    // 3. Call Cashfree API via Axios
+    const response = await axios.post(
+      `${CASHFREE_BASE_URL}/pg/orders`,
+      orderRequest,
+      {
+        headers: {
+          'Content-Type': 'application/json',
+          'x-api-version': API_VERSION,
+          'x-client-id': APP_ID,
+          'x-client-secret': SECRET_KEY,
+        }
+      }
+    );
+
+    const data = response.data;
+    console.log(`✅ Order created successfully:`, data.order_id);
 
     return res.json({
       success: true,
@@ -147,28 +161,42 @@ app.post("/api/cashfree/create_order", async (req, res) => {
 
   } catch (err) {
     console.error("❌ Create Order Error:", err.response?.data || err.message);
+    
+    const errorMessage = err.response?.data?.message || err.message || "Failed to create order";
+    const errorDetails = err.response?.data || {};
+    
     return res.status(500).json({ 
       success: false, 
-      message: err.response?.data?.message || "Failed to create order",
-      error: err.message
+      message: errorMessage,
+      error: errorDetails
     });
   }
 });
 
 /* ----------------------------------------
-   2) Get Order Status (For polling & verification)
+   2) Get Order Status (Polling)
 ----------------------------------------- */
 app.get("/api/cashfree/order_status/:orderId", async (req, res) => {
   try {
     const orderId = req.params.orderId;
     console.log(`🔍 Checking status for order: ${orderId}`);
     
-    // Get from Cashfree
-    const response = await Cashfree.PGFetchOrder("2023-08-01", orderId);
-    const cfStatus = response.data.order_status;
+    // Call Cashfree API via Axios
+    const response = await axios.get(
+      `${CASHFREE_BASE_URL}/pg/orders/${orderId}`,
+      {
+        headers: {
+          'x-api-version': API_VERSION,
+          'x-client-id': APP_ID,
+          'x-client-secret': SECRET_KEY,
+        }
+      }
+    );
     
-    // Also get from our DB
+    const cfStatus = response.data.order_status;
     const dbOrder = await getOrderByMerchantId(orderId);
+    
+    console.log(`📊 Status: Cashfree=${cfStatus}, DB=${dbOrder?.status || 'NOT_FOUND'}`);
     
     return res.json({ 
       success: true, 
@@ -179,11 +207,11 @@ app.get("/api/cashfree/order_status/:orderId", async (req, res) => {
       db_order: dbOrder
     });
   } catch (err) {
-    console.error("❌ Order Status Error:", err.message);
+    console.error("❌ Order Status Error:", err.response?.data || err.message);
     return res.status(500).json({ 
       success: false, 
       message: "Failed to fetch order status",
-      error: err.message 
+      error: err.response?.data || err.message 
     });
   }
 });
@@ -213,8 +241,6 @@ app.post("/api/cashfree/webhook", async (req, res) => {
 
       if (generatedSignature !== signature) {
         console.error("❌ Webhook Signature Mismatch");
-        console.error("Expected:", generatedSignature);
-        console.error("Received:", signature);
         return res.status(400).send("Invalid Signature");
       }
       console.log("✅ Webhook signature verified");
@@ -223,7 +249,7 @@ app.post("/api/cashfree/webhook", async (req, res) => {
       return res.status(400).send("Verification Failed");
     }
 
-    // 4. Process Payload
+    // Process Payload
     const payload = req.body;
     console.log(`📦 Webhook Type: ${payload.type}`);
 
@@ -257,11 +283,6 @@ app.post("/api/cashfree/webhook", async (req, res) => {
       
       console.log(`✅ Order ${orderId} marked as FAILED`);
     }
-    else if (payload.type === "PAYMENT_USER_DROPPED_WEBHOOK") {
-      const orderId = payload.data.order.order_id;
-      console.log(`⚠️ Payment Dropped: ${orderId}`);
-      // Keep as PENDING - user may retry
-    }
 
     return res.status(200).json({ success: true });
     
@@ -273,7 +294,7 @@ app.post("/api/cashfree/webhook", async (req, res) => {
 });
 
 /* ----------------------------------------
-   4) Get Order Details (For frontend verification)
+   4) Get Order Details
 ----------------------------------------- */
 app.get("/api/order/:merchantOrderId", async (req, res) => {
   try {
@@ -327,8 +348,20 @@ app.post("/api/cashfree/verify_payment", async (req, res) => {
       });
     }
 
+    console.log(`🔍 Verifying payment for: ${orderId}`);
+
     // Get from Cashfree
-    const cfResponse = await Cashfree.PGFetchOrder("2023-08-01", orderId);
+    const cfResponse = await axios.get(
+      `${CASHFREE_BASE_URL}/pg/orders/${orderId}`,
+      {
+        headers: {
+          'x-api-version': API_VERSION,
+          'x-client-id': APP_ID,
+          'x-client-secret': SECRET_KEY,
+        }
+      }
+    );
+    
     const cfStatus = cfResponse.data.order_status;
     
     // Get from DB
@@ -342,6 +375,17 @@ app.post("/api/cashfree/verify_payment", async (req, res) => {
         transactionTime: cfResponse.data.order_tags?.payment_time || new Date().toISOString(),
         status: "SUCCESS",
       });
+      
+      const updatedOrder = await getOrderByMerchantId(orderId);
+      
+      return res.json({
+        success: true,
+        verified: true,
+        cashfree_status: cfStatus,
+        db_status: "SUCCESS",
+        order: updatedOrder,
+        synced: true
+      });
     }
 
     return res.json({
@@ -353,11 +397,11 @@ app.post("/api/cashfree/verify_payment", async (req, res) => {
     });
 
   } catch (err) {
-    console.error("❌ Verify Payment Error:", err.message);
+    console.error("❌ Verify Payment Error:", err.response?.data || err.message);
     return res.status(500).json({ 
       success: false, 
       message: "Verification failed",
-      error: err.message 
+      error: err.response?.data || err.message 
     });
   }
 });
@@ -369,34 +413,24 @@ app.get("/health", (req, res) => {
   res.json({
     status: "OK",
     provider: "Cashfree",
-    env: Cashfree.XEnvironment,
-    timestamp: new Date().toISOString(),
-    endpoints: {
-      create_order: "/api/cashfree/create_order",
-      order_status: "/api/cashfree/order_status/:orderId",
-      verify_payment: "/api/cashfree/verify_payment",
-      webhook: "/api/cashfree/webhook",
-      get_order: "/api/order/:merchantOrderId"
-    }
+    env: CASHFREE_ENV,
+    timestamp: new Date().toISOString()
   });
 });
 
 /* ----------------------------------------
-   Error Handler
+   Error Handler & Start
 ----------------------------------------- */
 app.use((err, req, res, next) => {
   console.error("💥 Unhandled Error:", err);
   res.status(500).json({ 
     success: false, 
-    message: "Internal server error" 
+    message: "Internal server error",
+    error: process.env.NODE_ENV === 'development' ? err.message : undefined
   });
 });
 
-/* ----------------------------------------
-   Start Server
------------------------------------------ */
 app.listen(PORT, () => {
   console.log(`🚀 Server running on http://localhost:${PORT}`);
-  console.log(`🌍 Environment: ${Cashfree.XEnvironment}`);
-  console.log(`📡 Allowed Origins: ${ALLOWED_ORIGINS.join(", ")}`);
+  console.log(`🌍 Environment: ${CASHFREE_ENV}`);
 });
