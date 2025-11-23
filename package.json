@@ -11,10 +11,10 @@
   "dependencies": {
     "@libsql/client": "^0.15.15",
     "body-parser": "^1.20.2",
+    "cashfree-pg": "^5.1.0",
     "cors": "^2.8.5",
     "dotenv": "^16.3.1",
-    "express": "^4.18.2",
-    "pg-sdk-node": "https://phonepe.mycloudrepo.io/public/repositories/phonepe-pg-sdk-node/releases/v2/phonepe-pg-sdk-node.tgz"
+    "express": "^4.18.2"
   },
   "devDependencies": {
     "nodemon": "^3.1.11"
