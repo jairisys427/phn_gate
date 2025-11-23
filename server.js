@@ -3,10 +3,7 @@ import express from "express";
 import bodyParser from "body-parser";
 import dotenv from "dotenv";
 import { randomUUID } from "crypto";
-import {
-  StandardCheckoutClient, Env, MetaInfo,
-  StandardCheckoutPayRequest, CreateSdkOrderRequest, RefundRequest,
-} from "pg-sdk-node";
+import { Cashfree } from "cashfree-pg"; // Import Cashfree SDK
 
 import { createPendingOrder, updateOrderStatus, getOrderByMerchantId } from "./db.js";
 
@@ -16,56 +13,38 @@ dotenv.config();
    Helpers
 ----------------------------------------- */
 const trim = (v) => (typeof v === "string" ? v.trim() : v);
-const mask = (s, keep = 4) => {
-  if (!s) return "";
-  if (s.length <= keep * 2) return "*".repeat(s.length);
-  return s.slice(0, keep) + "*".repeat(Math.max(6, s.length - keep * 2)) + s.slice(-keep);
-};
 
 /* ----------------------------------------
    Load and validate env
 ----------------------------------------- */
-const MERCHANT_ID = trim(process.env.MERCHANT_ID || "");
-const SALT_KEY = trim(process.env.PHONEPE_SALT_KEY || "");
-const SALT_INDEX_RAW = trim(process.env.PHONEPE_SALT_INDEX || "");
-const SALT_INDEX = SALT_INDEX_RAW === "" ? NaN : parseInt(SALT_INDEX_RAW, 10);
-const PHONEPE_ENV =
-  (trim(process.env.PHONEPE_ENV || "SANDBOX").toUpperCase() === "PRODUCTION"
-    ? Env.PRODUCTION
-    : Env.SANDBOX);
+const APP_ID = trim(process.env.CASHFREE_APP_ID || "");
+const SECRET_KEY = trim(process.env.CASHFREE_SECRET_KEY || "");
+const CASHFREE_ENV = trim(process.env.CASHFREE_ENV || "SANDBOX").toUpperCase();
 
-if (!MERCHANT_ID || !SALT_KEY || Number.isNaN(SALT_INDEX)) {
-  console.error("Missing/invalid PhonePe config in .env");
+if (!APP_ID || !SECRET_KEY) {
+  console.error("Missing Cashfree config (APP_ID or SECRET_KEY) in .env");
   process.exit(1);
 }
 
 /* ----------------------------------------
-   Initialize PhonePe SDK
+   Initialize Cashfree SDK
 ----------------------------------------- */
-let phonepeClient;
-try {
-  console.log(
-    `Initializing PhonePe SDK (merchant=${mask(MERCHANT_ID)}, env=${PHONEPE_ENV === Env.PRODUCTION ? "PRODUCTION" : "SANDBOX"})`
-  );
-  phonepeClient = StandardCheckoutClient.getInstance(
-    MERCHANT_ID,
-    SALT_KEY,
-    SALT_INDEX,
-    PHONEPE_ENV
-  );
-} catch (err) {
-  console.error("PhonePe SDK init failed:", err?.message);
-  process.exit(1);
-}
+Cashfree.XClientId = APP_ID;
+Cashfree.XClientSecret = SECRET_KEY;
+Cashfree.XEnvironment = CASHFREE_ENV === "PRODUCTION" ? Cashfree.Environment.PRODUCTION : Cashfree.Environment.SANDBOX;
+
+console.log(`Initializing Cashfree SDK in ${CASHFREE_ENV} mode`);
 
 /* ----------------------------------------
    Express App
 ----------------------------------------- */
 const app = express();
+
+// Middleware to capture raw body for Webhook Verification
 app.use(
   bodyParser.json({
     verify: (req, res, buf) => {
-      req.rawBody = buf;
+      req.rawBody = buf.toString();
     },
   })
 );
@@ -97,19 +76,23 @@ app.use((req, res, next) => {
 const PORT = process.env.PORT || 5000;
 
 /* ----------------------------------------
-   1) Pay (Web) - Now creates a PENDING order first and appends merchantOrderId to redirectUrl
+   1) Create Order (Cashfree)
 ----------------------------------------- */
-app.post("/api/phonepe/pay", async (req, res) => {
+app.post("/api/cashfree/create_order", async (req, res) => {
   try {
     const { amountInPaise, redirectUrl, name, email, phone, courseId } = req.body;
 
-    if (!amountInPaise || amountInPaise < 100 || !redirectUrl || !name || !email || !phone || !courseId) {
+    if (!amountInPaise || !redirectUrl || !name || !email || !phone || !courseId) {
       return res.status(400).json({ success: false, message: "Missing required fields" });
     }
 
-    const merchantOrderId = `MUID-${randomUUID().slice(0, 16)}`;
+    // NOTE: Cashfree takes amount in RUPEES, but your DB/Frontend sends PAISE.
+    const amountInRupees = amountInPaise / 100;
 
-    // Create a pending order in the database before initiating payment
+    const merchantOrderId = `ORD-${randomUUID().slice(0, 12)}`; // Cashfree allows shorter IDs
+    const customerId = `CUST-${randomUUID().slice(0, 12)}`;
+
+    // 1. Store in DB as Pending
     await createPendingOrder({
       merchantOrderId,
       userName: name,
@@ -119,198 +102,116 @@ app.post("/api/phonepe/pay", async (req, res) => {
       amountPaise: amountInPaise
     });
 
-    // Append merchantOrderId to redirectUrl so the frontend can pick it up after redirect
-    const incomingRedirect = redirectUrl || "";
-    const separator = incomingRedirect.includes('?') ? '&' : '?';
-    const redirectWithId = `${incomingRedirect}${separator}merchantOrderId=${encodeURIComponent(merchantOrderId)}`;
+    // 2. Prepare Cashfree Request
+    const request = {
+      order_amount: amountInRupees,
+      order_currency: "INR",
+      order_id: merchantOrderId,
+      customer_details: {
+        customer_id: customerId,
+        customer_name: name,
+        customer_email: email,
+        customer_phone: phone,
+      },
+      order_meta: {
+        return_url: `${redirectUrl}?order_id=${merchantOrderId}`,
+        notify_url: `https://your-domain.com/api/cashfree/webhook` // Optional: explicitly set webhook url if not in dashboard
+      },
+      order_note: courseId // Store course ID in note
+    };
 
-    const metaInfo = MetaInfo.builder()
-      .udf1(courseId) // Store course ID
-      .udf2(email) // Store email
-      .udf3(phone) // Store phone
-      .build();
+    // 3. Call Cashfree API
+    const response = await Cashfree.PGCreateOrder("2023-08-01", request);
+    const data = response.data;
 
-    const request = StandardCheckoutPayRequest.builder()
-      .merchantOrderId(merchantOrderId)
-      .amount(amountInPaise)
-      .redirectUrl(redirectWithId)
-      .metaInfo(metaInfo)
-      .build();
-
-    const response = await phonepeClient.pay(request);
-
-    if (response.redirectUrl) {
-      return res.json({
-        success: true,
-        merchantOrderId,
-        redirectUrl: response.redirectUrl,
-      });
-    } else {
-      return res.status(403).json({
-        success: false,
-        error: "Account not activated",
-        onboardingUrl: response.data?.Onboarding_URL?.[0] || null,
-      });
-    }
-  } catch (err) {
-    console.error("Pay error:", err);
-    return res.status(500).json({ success: false, error: err?.message || "Failed" });
-  }
-});
-
-/* ----------------------------------------
-   2) SDK Order (Mobile) - create pending DB entry and append merchantOrderId to redirectUrl
------------------------------------------ */
-app.post("/api/phonepe/create_sdk_order", async (req, res) => {
-  try {
-    const { amountInPaise, redirectUrl, name, email, phone, courseId } = req.body;
-    if (!amountInPaise || amountInPaise < 100 || !redirectUrl) {
-      return res.status(400).json({ success: false, message: "Invalid input" });
-    }
-
-    const merchantOrderId = `MUID-${randomUUID().slice(0, 16)}`;
-
-    // Create pending order
-    try {
-      await createPendingOrder({
-        merchantOrderId,
-        userName: name || null,
-        email: email || null,
-        phone: phone || null,
-        courseId: courseId || null,
-        amountPaise: amountInPaise,
-      });
-    } catch (dbErr) {
-      console.error("Failed to create pending SDK order:", dbErr);
-      // continue - still try to create SDK order
-    }
-
-    const redirectWithId = `${redirectUrl}${redirectUrl.includes('?') ? '&' : '?'}merchantOrderId=${encodeURIComponent(merchantOrderId)}`;
-
-    const request = CreateSdkOrderRequest.StandardCheckoutBuilder()
-      .merchantOrderId(merchantOrderId)
-      .amount(amountInPaise)
-      .redirectUrl(redirectWithId)
-      .build();
-
-    const response = await phonepeClient.createSdkOrder(request);
-    return res.json({ success: true, merchantOrderId, token: response.token });
-  } catch (err) {
-    console.error("/create_sdk_order failed:", err);
-    return res.status(500).json({ success: false, error: err?.message });
-  }
-});
-
-/* ----------------------------------------
-   3) Order Status
------------------------------------------ */
-app.get("/api/phonepe/order_status/:merchantOrderId", async (req, res) => {
-  try {
-    const response = await phonepeClient.getOrderStatus(req.params.merchantOrderId);
-    return res.json({ success: true, data: response });
-  } catch (err) {
-    return res.status(500).json({ success: false, error: err?.message });
-  }
-});
-
-/* ----------------------------------------
-   4) Refund
------------------------------------------ */
-app.post("/api/phonepe/refund", async (req, res) => {
-  try {
-    const { originalMerchantOrderId, amountInPaise } = req.body;
-    if (!originalMerchantOrderId || !amountInPaise) {
-      return res.status(400).json({ success: false, message: "Missing fields" });
-    }
-
-    const merchantRefundId = `MRID-${randomUUID().slice(0, 16)}`;
-    const request = RefundRequest.builder()
-      .amount(amountInPaise)
-      .merchantRefundId(merchantRefundId)
-      .originalMerchantOrderId(originalMerchantOrderId)
-      .build();
-
-    const response = await phonepeClient.refund(request);
-    return res.json({ success: true, merchantRefundId, data: response });
-  } catch (err) {
-    return res.status(500).json({ success: false, error: err?.message });
-  }
-});
-
-/* ----------------------------------------
-   5) Webhook – Now updates the order status (robust timestamp handling)
------------------------------------------ */
-app.post("/api/phonepe/webhook", async (req, res) => {
-  try {
-    const authHeader = req.headers["authorization"] || "";
-    const bodyString = req.rawBody?.toString("utf8") || "";
-    const callbackUser = process.env.CALLBACK_USERNAME;
-    const callbackPass = process.env.CALLBACK_PASSWORD;
-
-    if (!callbackUser || !callbackPass) {
-      console.error("Webhook auth credentials missing in environment variables.");
-      return res.status(500).send("Webhook auth missing");
-    }
-
-    // Validate callback (SDK helper). It should throw or return an object with payload
-    let callbackResponse;
-    try {
-      callbackResponse = phonepeClient.validateCallback(callbackUser, callbackPass, authHeader, bodyString);
-    } catch (err) {
-      console.error("Callback validation failed:", err?.message || err);
-      return res.status(403).send("Invalid callback");
-    }
-
-    const payload = callbackResponse.payload;
-    console.log("WEBHOOK PAYLOAD:", JSON.stringify(payload, null, 2));
-
-    const merchantOrderId = payload?.merchantOrderId;
-    if (!merchantOrderId) {
-      console.warn("Webhook missing merchantOrderId, ignoring.");
-      return res.status(400).send("Missing merchantOrderId");
-    }
-
-    // payment state
-    const paymentState = payload.state;
-    const isSuccess = paymentState === "COMPLETED";
-    const status = isSuccess ? "SUCCESS" : "FAILED";
-
-    // Try to extract a timestamp robustly
-    let rawTimestamp = payload.paymentDetails?.[0]?.timestamp ?? payload.timestamp ?? null;
-
-    // Some providers send unix seconds, some send milliseconds. Normalize:
-    let transactionTime;
-    if (rawTimestamp) {
-      rawTimestamp = typeof rawTimestamp === "string" ? parseInt(rawTimestamp, 10) : rawTimestamp;
-      if (!Number.isNaN(rawTimestamp)) {
-        if (rawTimestamp < 1e12) rawTimestamp = rawTimestamp * 1000; // convert seconds -> ms
-        transactionTime = new Date(rawTimestamp).toISOString();
-      } else {
-        console.warn("Webhook timestamp parse failed, using server time");
-        transactionTime = new Date().toISOString();
-      }
-    } else {
-      transactionTime = new Date().toISOString();
-    }
-
-    console.log(`WEBHOOK: merchantOrderId=${merchantOrderId} state=${paymentState} time=${transactionTime}`);
-
-    await updateOrderStatus({
-      merchantOrderId,
-      transactionTime,
-      status,
+    // Cashfree returns a 'payment_session_id'. The frontend needs this to launch the SDK.
+    return res.json({
+      success: true,
+      payment_session_id: data.payment_session_id,
+      order_id: data.order_id,
     });
 
-    return res.json({ success: true });
   } catch (err) {
-    console.error("Webhook failed:", err?.message || err);
-    console.error(err);
-    return res.status(403).send("Invalid");
+    console.error("Create Order Error:", err.response?.data?.message || err.message);
+    return res.status(500).json({ 
+      success: false, 
+      error: err.response?.data?.message || "Failed to create order" 
+    });
   }
 });
 
 /* ----------------------------------------
-   6) Get Order (Updated)
+   2) Get Order Status (Polling)
+----------------------------------------- */
+app.get("/api/cashfree/order_status/:orderId", async (req, res) => {
+  try {
+    const orderId = req.params.orderId;
+    const response = await Cashfree.PGFetchOrder("2023-08-01", orderId);
+    
+    // Cashfree status: PAID, ACTIVE, EXPIRED
+    return res.json({ 
+      success: true, 
+      status: response.data.order_status,
+      data: response.data 
+    });
+  } catch (err) {
+    return res.status(500).json({ success: false, error: err.message });
+  }
+});
+
+/* ----------------------------------------
+   3) Webhook
+----------------------------------------- */
+app.post("/api/cashfree/webhook", async (req, res) => {
+  try {
+    const signature = req.headers["x-webhook-signature"];
+    const timestamp = req.headers["x-webhook-timestamp"];
+    const rawBody = req.rawBody;
+
+    // 1. Verify Signature
+    try {
+        Cashfree.PGVerifyWebhookSignature(signature, rawBody, timestamp);
+    } catch (err) {
+        console.error("Webhook Signature Verification Failed");
+        return res.status(400).send("Invalid Signature");
+    }
+
+    // 2. Parse Body
+    const payload = req.body;
+    console.log("WEBHOOK PAYLOAD:", JSON.stringify(payload, null, 2));
+
+    if (payload.type === "PAYMENT_SUCCESS_WEBHOOK") {
+        const orderId = payload.data.order.order_id;
+        const transactionTime = payload.data.payment.payment_time || new Date().toISOString();
+        const paymentStatus = payload.data.payment.payment_status; // "SUCCESS"
+
+        // Map Cashfree status to DB status
+        // Cashfree usually sends "SUCCESS" in webhook for payment success
+        const dbStatus = paymentStatus === "SUCCESS" ? "SUCCESS" : "FAILED";
+
+        await updateOrderStatus({
+            merchantOrderId: orderId,
+            transactionTime,
+            status: dbStatus,
+        });
+    } else if (payload.type === "PAYMENT_FAILED_WEBHOOK") {
+        const orderId = payload.data.order.order_id;
+        await updateOrderStatus({
+            merchantOrderId: orderId,
+            transactionTime: new Date().toISOString(),
+            status: "FAILED",
+        });
+    }
+
+    return res.status(200).json({ success: true });
+  } catch (err) {
+    console.error("Webhook processing error:", err);
+    return res.status(500).send("Internal Server Error");
+  }
+});
+
+/* ----------------------------------------
+   4) Get Order Details (For Frontend Success Page)
 ----------------------------------------- */
 app.get("/api/order/:merchantOrderId", async (req, res) => {
   try {
@@ -325,8 +226,7 @@ app.get("/api/order/:merchantOrderId", async (req, res) => {
       email: order.email || "Not provided",
       phone: order.phone_number || "Not provided",
       date: order.transaction_date ? new Date(order.transaction_date).toLocaleDateString('en-IN') : 'N/A',
-      transaction_id: order.order_number || order.merchant_order_id, // prefer order_number
-      status: order.status,
+      status: order.status, 
     });
   } catch (err) {
     console.error(err);
@@ -335,13 +235,13 @@ app.get("/api/order/:merchantOrderId", async (req, res) => {
 });
 
 /* ----------------------------------------
-   7) Health
+   Health Check
 ----------------------------------------- */
 app.get("/health", (req, res) => {
   res.json({
     status: "OK",
-    env: PHONEPE_ENV === Env.PRODUCTION ? "PRODUCTION" : "SANDBOX",
-    merchantId: mask(MERCHANT_ID),
+    provider: "Cashfree",
+    env: CASHFREE_ENV,
     timestamp: new Date().toISOString(),
   });
 });
@@ -351,5 +251,4 @@ app.get("/health", (req, res) => {
 ----------------------------------------- */
 app.listen(PORT, () => {
   console.log(`Server running on http://localhost:${PORT}`);
-  console.log(`Environment: ${PHONEPE_ENV === Env.PRODUCTION ? "PRODUCTION" : "SANDBOX"}`);
 });
