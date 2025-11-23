@@ -2,7 +2,7 @@
 import express from "express";
 import bodyParser from "body-parser";
 import dotenv from "dotenv";
-import { randomUUID, createHmac } from "crypto"; // Added createHmac
+import { randomUUID, createHmac } from "crypto"; // IMPORT createHmac
 import { Cashfree } from "cashfree-pg"; 
 
 import { createPendingOrder, updateOrderStatus, getOrderByMerchantId } from "./db.js";
@@ -31,6 +31,7 @@ if (!APP_ID || !SECRET_KEY) {
 ----------------------------------------- */
 Cashfree.XClientId = APP_ID;
 Cashfree.XClientSecret = SECRET_KEY;
+// Using strings avoids SDK version compatibility issues
 Cashfree.XEnvironment = CASHFREE_ENV === "PRODUCTION" ? "PRODUCTION" : "SANDBOX";
 
 console.log(`Initializing Cashfree SDK in ${Cashfree.XEnvironment} mode`);
@@ -158,7 +159,7 @@ app.get("/api/cashfree/order_status/:orderId", async (req, res) => {
 });
 
 /* ----------------------------------------
-   3) Webhook (MANUAL VERIFICATION FIX)
+   3) Webhook (FIXED: MANUAL VERIFICATION)
 ----------------------------------------- */
 app.post("/api/cashfree/webhook", async (req, res) => {
   try {
@@ -171,18 +172,20 @@ app.post("/api/cashfree/webhook", async (req, res) => {
     }
 
     // --- MANUAL VERIFICATION LOGIC START ---
-    // 1. Create the signature string: timestamp + raw body
-    const data = timestamp + rawBody;
-    
-    // 2. Hash it using your Secret Key
-    const generatedSignature = createHmac('sha256', SECRET_KEY)
-        .update(data)
-        .digest('base64');
+    // This replaces the broken SDK function
+    try {
+        const data = timestamp + rawBody;
+        const generatedSignature = createHmac('sha256', SECRET_KEY)
+            .update(data)
+            .digest('base64');
 
-    // 3. Compare
-    if (generatedSignature !== signature) {
-        console.error("Webhook Signature Verification Failed: Signatures do not match");
-        return res.status(400).send("Invalid Signature");
+        if (generatedSignature !== signature) {
+            console.error("Webhook Signature Mismatch");
+            return res.status(400).send("Invalid Signature");
+        }
+    } catch (verifyError) {
+        console.error("Verification Error:", verifyError);
+        return res.status(400).send("Verification Failed");
     }
     // --- MANUAL VERIFICATION LOGIC END ---
 
@@ -217,7 +220,6 @@ app.post("/api/cashfree/webhook", async (req, res) => {
     return res.status(200).json({ success: true });
   } catch (err) {
     console.error("Webhook processing error:", err.message);
-    // Return 200 so Cashfree doesn't retry indefinitely
     return res.status(200).send("OK"); 
   }
 });
