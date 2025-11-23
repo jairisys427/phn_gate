@@ -2,7 +2,7 @@
 import express from "express";
 import bodyParser from "body-parser";
 import dotenv from "dotenv";
-import { randomUUID } from "crypto";
+import { randomUUID, createHmac } from "crypto"; // Added createHmac
 import { Cashfree } from "cashfree-pg"; 
 
 import { createPendingOrder, updateOrderStatus, getOrderByMerchantId } from "./db.js";
@@ -27,12 +27,10 @@ if (!APP_ID || !SECRET_KEY) {
 }
 
 /* ----------------------------------------
-   Initialize Cashfree SDK (FIXED)
+   Initialize Cashfree SDK
 ----------------------------------------- */
 Cashfree.XClientId = APP_ID;
 Cashfree.XClientSecret = SECRET_KEY;
-
-// FIX: Use simple strings instead of Cashfree.Environment.SANDBOX which was undefined
 Cashfree.XEnvironment = CASHFREE_ENV === "PRODUCTION" ? "PRODUCTION" : "SANDBOX";
 
 console.log(`Initializing Cashfree SDK in ${Cashfree.XEnvironment} mode`);
@@ -106,7 +104,6 @@ app.post("/api/cashfree/create_order", async (req, res) => {
     });
 
     // 2. Prepare Cashfree Request
-    // Note: '2023-08-01' is the API version required by the SDK
     const request = {
       order_amount: amountInRupees,
       order_currency: "INR",
@@ -127,7 +124,6 @@ app.post("/api/cashfree/create_order", async (req, res) => {
     const response = await Cashfree.PGCreateOrder("2023-08-01", request);
     const data = response.data;
 
-    // Return the payment_session_id to frontend
     return res.json({
       success: true,
       payment_session_id: data.payment_session_id,
@@ -153,7 +149,7 @@ app.get("/api/cashfree/order_status/:orderId", async (req, res) => {
     
     return res.json({ 
       success: true, 
-      status: response.data.order_status, // "PAID", "ACTIVE", "EXPIRED"
+      status: response.data.order_status, 
       data: response.data 
     });
   } catch (err) {
@@ -162,34 +158,42 @@ app.get("/api/cashfree/order_status/:orderId", async (req, res) => {
 });
 
 /* ----------------------------------------
-   3) Webhook
+   3) Webhook (MANUAL VERIFICATION FIX)
 ----------------------------------------- */
 app.post("/api/cashfree/webhook", async (req, res) => {
   try {
     const signature = req.headers["x-webhook-signature"];
     const timestamp = req.headers["x-webhook-timestamp"];
-    const rawBody = req.rawBody; // Captured by body-parser verify
+    const rawBody = req.rawBody; // Captured by body-parser middleware
 
     if (!signature || !timestamp || !rawBody) {
         return res.status(400).send("Missing headers");
     }
 
-    // 1. Verify Signature
-    try {
-        Cashfree.PGVerifyWebhookSignature(signature, rawBody, timestamp);
-    } catch (err) {
-        console.error("Webhook Signature Verification Failed:", err.message);
+    // --- MANUAL VERIFICATION LOGIC START ---
+    // 1. Create the signature string: timestamp + raw body
+    const data = timestamp + rawBody;
+    
+    // 2. Hash it using your Secret Key
+    const generatedSignature = createHmac('sha256', SECRET_KEY)
+        .update(data)
+        .digest('base64');
+
+    // 3. Compare
+    if (generatedSignature !== signature) {
+        console.error("Webhook Signature Verification Failed: Signatures do not match");
         return res.status(400).send("Invalid Signature");
     }
+    // --- MANUAL VERIFICATION LOGIC END ---
 
-    // 2. Process Payload
+    // 4. Process Payload
     const payload = req.body;
     console.log("WEBHOOK RECEIVED:", payload.type);
 
     if (payload.type === "PAYMENT_SUCCESS_WEBHOOK") {
         const orderId = payload.data.order.order_id;
         const transactionTime = payload.data.payment.payment_time || new Date().toISOString();
-        const paymentStatus = payload.data.payment.payment_status; // usually "SUCCESS"
+        const paymentStatus = payload.data.payment.payment_status; 
 
         const dbStatus = paymentStatus === "SUCCESS" ? "SUCCESS" : "FAILED";
 
@@ -213,13 +217,13 @@ app.post("/api/cashfree/webhook", async (req, res) => {
     return res.status(200).json({ success: true });
   } catch (err) {
     console.error("Webhook processing error:", err.message);
-    // Always return 200 to Cashfree otherwise they will retry
+    // Return 200 so Cashfree doesn't retry indefinitely
     return res.status(200).send("OK"); 
   }
 });
 
 /* ----------------------------------------
-   4) Get Order Details (Frontend Success Page)
+   4) Get Order Details
 ----------------------------------------- */
 app.get("/api/order/:merchantOrderId", async (req, res) => {
   try {
