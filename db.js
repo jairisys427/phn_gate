@@ -10,7 +10,7 @@ const TURSO_DATABASE_URL = trim(process.env.TURSO_DATABASE_URL || "");
 const TURSO_AUTH_TOKEN = trim(process.env.TURSO_AUTH_TOKEN || "");
 
 if (!TURSO_DATABASE_URL || !TURSO_AUTH_TOKEN) {
-  console.error("Missing Turso credentials in .env");
+  console.error("❌ Missing Turso credentials in .env");
   process.exit(1);
 }
 
@@ -19,33 +19,60 @@ const db = createClient({
   authToken: TURSO_AUTH_TOKEN,
 });
 
-// This schema is correct for future/new databases.
-// The ALTER command was needed to update your existing one.
+/* ------------------------------------------------
+   SCHEMA + SAFE MIGRATIONS
+------------------------------------------------- */
 (async () => {
   try {
+    // 1️⃣ Create table if it does NOT exist (new DBs)
     await db.execute(`
       CREATE TABLE IF NOT EXISTS orders (
         id                INTEGER PRIMARY KEY AUTOINCREMENT,
-        order_number      TEXT    UNIQUE,
-        merchant_order_id TEXT    NOT NULL UNIQUE,
+        order_number      TEXT UNIQUE,
+        merchant_order_id TEXT,
         transaction_date  TEXT,
         phone_number      TEXT,
         email             TEXT,
-        user_name         TEXT,    -- This column is now in your DB
-        course_id         TEXT,    -- This column is now in your DB
+        user_name         TEXT,
+        course_id         TEXT,
         amount_paise      INTEGER NOT NULL,
-        status            TEXT    NOT NULL CHECK(status IN ('SUCCESS','FAILED','PENDING')),
-        created_at        TEXT    NOT NULL DEFAULT (datetime('now'))
+        status            TEXT NOT NULL CHECK(status IN ('SUCCESS','FAILED','PENDING')),
+        created_at        TEXT NOT NULL DEFAULT (datetime('now'))
       )
     `);
-    console.log("Table `orders` ready");
+
+    // 2️⃣ Migrate OLD databases safely
+    // SQLite doesn't support IF NOT EXISTS for ADD COLUMN
+    const migrations = [
+      `ALTER TABLE orders ADD COLUMN merchant_order_id TEXT`,
+      `ALTER TABLE orders ADD COLUMN user_name TEXT`,
+      `ALTER TABLE orders ADD COLUMN course_id TEXT`,
+    ];
+
+    for (const sql of migrations) {
+      try {
+        await db.execute(sql);
+      } catch (_) {
+        // Column already exists – safe to ignore
+      }
+    }
+
+    // 3️⃣ Ensure UNIQUE constraint for merchant_order_id
+    await db.execute(`
+      CREATE UNIQUE INDEX IF NOT EXISTS idx_orders_merchant_order_id
+      ON orders (merchant_order_id)
+    `);
+
+    console.log("✅ Table `orders` ready + migrations applied");
   } catch (err) {
-    console.error("Failed to create orders table:", err);
+    console.error("❌ Failed to initialize database:", err);
     process.exit(1);
   }
 })();
 
-// Helper to generate a unique order number for successful transactions
+/* ------------------------------------------------
+   HELPERS
+------------------------------------------------- */
 function generateOrderNumber() {
   const now = new Date();
   const datePart = now.toISOString().slice(0, 10).replace(/-/g, "");
@@ -53,7 +80,9 @@ function generateOrderNumber() {
   return `ORD-${datePart}-${rand}`;
 }
 
-// 1. Create a PENDING order when payment is initiated
+/* ------------------------------------------------
+   1) CREATE PENDING ORDER
+------------------------------------------------- */
 export async function createPendingOrder({
   merchantOrderId,
   userName,
@@ -64,29 +93,51 @@ export async function createPendingOrder({
 }) {
   try {
     const sql = `
-      INSERT INTO orders (merchant_order_id, user_name, email, phone_number, course_id, amount_paise, status)
+      INSERT INTO orders (
+        merchant_order_id,
+        user_name,
+        email,
+        phone_number,
+        course_id,
+        amount_paise,
+        status
+      )
       VALUES (?, ?, ?, ?, ?, ?, 'PENDING')
       ON CONFLICT(merchant_order_id) DO NOTHING
     `;
-    const args = [merchantOrderId, userName, email, phone, courseId, amountPaise];
+
+    const args = [
+      merchantOrderId,
+      userName,
+      email,
+      phone,
+      courseId,
+      amountPaise,
+    ];
+
     const result = await db.execute({ sql, args });
-    console.log(`DB PENDING: ${merchantOrderId} | User: ${userName} | Rows affected: ${result.rowsAffected}`);
+
+    console.log(
+      `🟡 DB PENDING: ${merchantOrderId} | User: ${userName} | Rows: ${result.rowsAffected}`
+    );
+
     return result;
   } catch (err) {
-    console.error("DB PENDING FAILED:", err);
-    throw err; // Re-throw to be caught by the API route
+    console.error("❌ DB PENDING FAILED:", err);
+    throw err;
   }
 }
 
-
-// 2. Update order status from webhook
+/* ------------------------------------------------
+   2) UPDATE ORDER STATUS (Webhook / Verify)
+------------------------------------------------- */
 export async function updateOrderStatus({
   merchantOrderId,
   transactionTime,
-  status, // 'SUCCESS' or 'FAILED'
+  status, // SUCCESS | FAILED
 }) {
   try {
-    console.log(`DB UPDATE: ${merchantOrderId} | Status: ${status}`);
+    console.log(`🔄 DB UPDATE: ${merchantOrderId} → ${status}`);
 
     const isSuccess = status === "SUCCESS";
     const orderNumber = isSuccess ? generateOrderNumber() : null;
@@ -97,29 +148,35 @@ export async function updateOrderStatus({
           status = ?,
           order_number = ?,
           transaction_date = ?
-        WHERE merchant_order_id = ? AND status = 'PENDING'
+        WHERE merchant_order_id = ?
+          AND status = 'PENDING'
       `
       : `
         UPDATE orders SET
           status = ?,
           transaction_date = ?
-        WHERE merchant_order_id = ? AND status = 'PENDING'
+        WHERE merchant_order_id = ?
+          AND status = 'PENDING'
       `;
-      
+
     const args = isSuccess
       ? [status, orderNumber, transactionTime, merchantOrderId]
       : [status, transactionTime, merchantOrderId];
 
     const result = await db.execute({ sql, args });
-    console.log(`DB UPDATE SUCCESS: Affected rows: ${result.rowsAffected} | Order#: ${orderNumber || 'N/A'}`);
-  } catch (err)
- {
-    console.error("DB UPDATE FAILED:", err.message || err);
-    // Don't throw - webhook must return 200 OK
+
+    console.log(
+      `✅ DB UPDATE DONE | Rows: ${result.rowsAffected} | Order#: ${orderNumber || "N/A"}`
+    );
+  } catch (err) {
+    console.error("❌ DB UPDATE FAILED:", err.message || err);
+    // webhook must never fail
   }
 }
 
-// Get order by merchant order ID (no changes needed)
+/* ------------------------------------------------
+   3) GET ORDER BY MERCHANT ID
+------------------------------------------------- */
 export async function getOrderByMerchantId(merchantOrderId) {
   try {
     const { rows } = await db.execute({
@@ -128,7 +185,7 @@ export async function getOrderByMerchantId(merchantOrderId) {
     });
     return rows[0] || null;
   } catch (err) {
-    console.error("DB GET FAILED:", err);
+    console.error("❌ DB GET FAILED:", err);
     throw err;
   }
 }
