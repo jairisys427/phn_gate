@@ -338,73 +338,99 @@ app.get("/api/order/:merchantOrderId", async (req, res) => {
    5) Verify Payment (For frontend to double-check)
 ----------------------------------------- */
 app.post("/api/cashfree/verify_payment", async (req, res) => {
+  const { orderId } = req.body;
+
+  if (!orderId) {
+    return res.status(400).json({
+      success: false,
+      message: "Order ID required",
+    });
+  }
+
+  console.log(`🔍 Verifying payment for: ${orderId}`);
+
+  // 1️⃣ Always check DB first (webhook may have updated it)
+  const dbOrder = await getOrderByMerchantId(orderId);
+
+  if (dbOrder?.status === "SUCCESS") {
+    return res.json({
+      success: true,
+      verified: true,
+      source: "DB",
+      cashfree_status: "PAID",
+      db_status: "SUCCESS",
+      order: dbOrder,
+    });
+  }
+
+  // 2️⃣ Call Cashfree ONLY if DB is pending
   try {
-    const { orderId } = req.body;
-    
-    if (!orderId) {
-      return res.status(400).json({ 
-        success: false, 
-        message: "Order ID required" 
-      });
-    }
-
-    console.log(`🔍 Verifying payment for: ${orderId}`);
-
-    // Get from Cashfree
     const cfResponse = await axios.get(
       `${CASHFREE_BASE_URL}/pg/orders/${orderId}`,
       {
         headers: {
-          'x-api-version': API_VERSION,
-          'x-client-id': APP_ID,
-          'x-client-secret': SECRET_KEY,
-        }
+          "x-api-version": API_VERSION,
+          "x-client-id": APP_ID,
+          "x-client-secret": SECRET_KEY,
+        },
       }
     );
-    
+
     const cfStatus = cfResponse.data.order_status;
-    
-    // Get from DB
-    const dbOrder = await getOrderByMerchantId(orderId);
-    
-    // If Cashfree says success but DB is still pending, update DB
+    console.log(`📡 Cashfree status: ${cfStatus}`);
+
+    // If Cashfree says PAID but DB is still PENDING → sync
     if (cfStatus === "PAID" && dbOrder?.status === "PENDING") {
-      console.log(`⚠️ Sync issue detected for ${orderId}, updating DB...`);
       await updateOrderStatus({
         merchantOrderId: orderId,
-        transactionTime: cfResponse.data.order_tags?.payment_time || new Date().toISOString(),
+        transactionTime:
+          cfResponse.data.order_tags?.payment_time ||
+          new Date().toISOString(),
         status: "SUCCESS",
       });
-      
+
       const updatedOrder = await getOrderByMerchantId(orderId);
-      
+
       return res.json({
         success: true,
         verified: true,
+        source: "CASHFREE_SYNC",
         cashfree_status: cfStatus,
         db_status: "SUCCESS",
         order: updatedOrder,
-        synced: true
       });
     }
 
     return res.json({
       success: true,
-      verified: cfStatus === "PAID",
+      verified: false,
       cashfree_status: cfStatus,
-      db_status: dbOrder?.status,
-      order: dbOrder
+      db_status: dbOrder?.status || "PENDING",
+      retry: true,
     });
-
   } catch (err) {
+    // 3️⃣ VERY IMPORTANT: 404 ≠ FAILED
+    if (err.response?.status === 404) {
+      console.warn("⚠️ Cashfree 404 – retry later");
+
+      return res.json({
+        success: true,
+        verified: false,
+        message: "Payment processing. Please wait...",
+        retry: true,
+        db_status: dbOrder?.status || "PENDING",
+      });
+    }
+
     console.error("❌ Verify Payment Error:", err.response?.data || err.message);
-    return res.status(500).json({ 
-      success: false, 
-      message: "Verification failed",
-      error: err.response?.data || err.message 
+
+    return res.status(500).json({
+      success: false,
+      message: "Verification error",
     });
   }
 });
+
 
 /* ----------------------------------------
    Health Check
@@ -434,3 +460,4 @@ app.listen(PORT, () => {
   console.log(`🚀 Server running on http://localhost:${PORT}`);
   console.log(`🌍 Environment: ${CASHFREE_ENV}`);
 });
+
